@@ -40,6 +40,11 @@
         <DestinationRoot>$(MSBuildProjectDirectory)\..\MessagePipe.Unity\Assets\Plugins\MessagePipe\Runtime\</DestinationRoot>
     </PropertyGroup>
     <ItemGroup>
+        <ProjectReference Include="$(MSBuildProjectDirectory)\..\..\tools\PostBuildUtility\PostBuildUtility.csproj" 
+                          ReferenceOutputAssembly="false" 
+                          SetTargetFramework="TargetFramework=net5.0"
+                          SetConfiguration="Configuration=$(Configuration)"
+                          SetPlatform="Platform=AnyCPU"/>
         <TargetFiles1 Include="$(MSBuildProjectDirectory)\**\*.cs" Exclude="**\bin\**\*.*;**\obj\**\*.*;_InternalVisibleTo.cs" />
     </ItemGroup>
 
