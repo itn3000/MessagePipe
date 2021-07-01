@@ -6,6 +6,9 @@ using System.Threading;
 using System.Diagnostics;
 using MessagePipe.Interprocess;
 using System.IO;
+using OpenTelemetry.Exporter;
+using OpenTelemetry;
+using OpenTelemetry.Trace;
 
 namespace MessagePipeDiagnosticsApp
 {
@@ -45,30 +48,25 @@ namespace MessagePipeDiagnosticsApp
     }
     class Program
     {
-        static void Main(string[] args)
+        static async Task Main(string[] args)
         {
             using var tempPath = new DisposableTempPath(true);
             var services = new ServiceCollection();
-            services.AddMessagePipe()
-                .AddMessagePipeTcpInterprocessUds(tempPath.TempPath)
+            using var tracer = Sdk.CreateTracerProviderBuilder()
+                .AddSource("MessagePipe.Interprocess.Workers.TcpWorker")
+                .AddConsoleExporter()
+                .Build()
                 ;
-            using var listener = new ActivityListener();
-            ActivitySamplingResult Sample(ref ActivityCreationOptions<ActivityContext> options)
-            {
-                return ActivitySamplingResult.AllData;
-            }
-            listener.Sample += Sample;
-            listener.ShouldListenTo += (src) =>
-            {
-                if(src.Name.StartsWith("MessagePipe"))
+            var provider = services.AddMessagePipe()
+                .AddMessagePipeTcpInterprocessUds(tempPath.TempPath, options =>
                 {
-                    return true;
-                }
-                else
-                {
-                    return false;
-                }
-            };
+                    options.HostAsServer = true;
+                })
+                .AddAsyncRequestHandler<MyAsyncHandler>()
+                .BuildServiceProvider()
+                ;
+            var requestor = provider.GetService<IRemoteRequestHandler<int, byte[]>>() ?? throw new ArgumentNullException("provider");
+            await requestor.InvokeAsync(1);
         }
     }
 }
