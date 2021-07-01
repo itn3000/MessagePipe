@@ -3,17 +3,16 @@ using System.Net;
 using System.Net.Sockets;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Diagnostics;
 
 namespace MessagePipe.Interprocess.Workers
 {
     // TODO:TCP STREAM AND READ
-
     internal sealed class SocketTcpServer : IDisposable
     {
         const int MaxConnections = 0x7fffffff;
 
         readonly Socket socket;
-
         SocketTcpServer(AddressFamily addressFamily, ProtocolType protocolType, int? sendBufferSize, int? recvBufferSize)
         {
             socket = new Socket(addressFamily, SocketType.Stream, protocolType);

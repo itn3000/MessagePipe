@@ -11,6 +11,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Diagnostics;
 
 namespace MessagePipe.Interprocess.Workers
 {
@@ -33,6 +34,7 @@ namespace MessagePipe.Interprocess.Workers
         // request-response
         int messageId = 0;
         ConcurrentDictionary<int, TaskCompletionSource<IInterprocessValue>> responseCompletions = new ConcurrentDictionary<int, TaskCompletionSource<IInterprocessValue>>();
+        private static readonly ActivitySource activitySource = new ActivitySource("MessagePipe.Interprocess.Workers.TcpWorker");
 
         // create from DI
         [Preserve]
@@ -107,31 +109,41 @@ namespace MessagePipe.Interprocess.Workers
 #endif
         public void Publish<TKey, TMessage>(TKey key, TMessage message)
         {
-            if (Interlocked.Increment(ref initializedClient) == 1) // first incr, channel not yet started
+            using (var act = activitySource.StartActivity("Publish"))
             {
-                _ = client.Value; // init
-                RunPublishLoop();
+                if (Interlocked.Increment(ref initializedClient) == 1) // first incr, channel not yet started
+                {
+                    _ = client.Value; // init
+                    RunPublishLoop();
+                }
+                act?.AddEvent(new ActivityEvent("BeginBuildMessage"));
+                var buffer = MessageBuilder.BuildPubSubMessage(key, message, options.MessagePackSerializerOptions);
+                act?.AddEvent(new ActivityEvent("BeginTryWrite"));
+                channel.Writer.TryWrite(buffer);
             }
-
-            var buffer = MessageBuilder.BuildPubSubMessage(key, message, options.MessagePackSerializerOptions);
-            channel.Writer.TryWrite(buffer);
         }
 
         public async ValueTask<TResponse> RequestAsync<TRequest, TResponse>(TRequest request, CancellationToken cancellationToken)
         {
-            if (Interlocked.Increment(ref initializedClient) == 1) // first incr, channel not yet started
+            using (var activity = activitySource.StartActivity("Request"))
             {
-                _ = client.Value; // init
-                RunPublishLoop();
+                if (Interlocked.Increment(ref initializedClient) == 1) // first incr, channel not yet started
+                {
+                    _ = client.Value; // init
+                    RunPublishLoop();
+                }
+                activity?.AddEvent(new ActivityEvent("IncMid"));
+                var mid = Interlocked.Increment(ref messageId);
+                var tcs = new TaskCompletionSource<IInterprocessValue>();
+                responseCompletions[mid] = tcs;
+                activity?.AddEvent(new ActivityEvent("BuildMsg"));
+                var buffer = MessageBuilder.BuildRemoteRequestMessage(typeof(TRequest), typeof(TResponse), mid, request, options.MessagePackSerializerOptions);
+                channel.Writer.TryWrite(buffer);
+                activity?.AddEvent(new ActivityEvent("WaitTask"));
+                var memoryValue = await tcs.Task.ConfigureAwait(false);
+                activity?.AddEvent(new ActivityEvent("Serialize"));
+                return MessagePackSerializer.Deserialize<TResponse>(memoryValue.ValueMemory, options.MessagePackSerializerOptions);
             }
-
-            var mid = Interlocked.Increment(ref messageId);
-            var tcs = new TaskCompletionSource<IInterprocessValue>();
-            responseCompletions[mid] = tcs;
-            var buffer = MessageBuilder.BuildRemoteRequestMessage(typeof(TRequest), typeof(TResponse), mid, request, options.MessagePackSerializerOptions);
-            channel.Writer.TryWrite(buffer);
-            var memoryValue = await tcs.Task.ConfigureAwait(false);
-            return MessagePackSerializer.Deserialize<TResponse>(memoryValue.ValueMemory, options.MessagePackSerializerOptions);
         }
 
         // Send packet to tcp socket from publisher
@@ -148,7 +160,10 @@ namespace MessagePipe.Interprocess.Workers
                 {
                     try
                     {
-                        await tcpClient.SendAsync(item, token).ConfigureAwait(false);
+                        using(var act = activitySource.StartActivity("PublishLoop"))
+                        {
+                            await tcpClient.SendAsync(item, token).ConfigureAwait(false);
+                        }
                     }
                     catch (Exception ex)
                     {
@@ -183,6 +198,7 @@ namespace MessagePipe.Interprocess.Workers
                 ReadOnlyMemory<byte> value = Array.Empty<byte>();
                 try
                 {
+                    using var act = activitySource.StartActivity("RunRecvLoop");
                     if (readBuffer.Length == 0)
                     {
                         var readLen = await client.ReceiveAsync(buffer, 0, buffer.Length, token).ConfigureAwait(false);
@@ -199,6 +215,7 @@ namespace MessagePipe.Interprocess.Workers
                         readBuffer = newBuffer;
                     }
 
+                    using var fetchmsgact = activitySource.StartActivity("FetchMessage");
                     var messageLen = MessageBuilder.FetchMessageLength(readBuffer.Span);
                     if (readBuffer.Length == (messageLen + 4)) // just size
                     {
@@ -248,20 +265,26 @@ namespace MessagePipe.Interprocess.Workers
             PARSE_MESSAGE:
                 try
                 {
+                    using var act = activitySource.StartActivity("ParseMessage");
                     var message = MessageBuilder.ReadPubSubMessage(value.ToArray()); // can avoid copy?
                     switch (message.MessageType)
                     {
                         case MessageType.PubSub:
-                            publisher.Publish(message, message, CancellationToken.None);
+                            {
+                                using var pubact = activitySource.StartActivity("PubSub");
+                                publisher.Publish(message, message, CancellationToken.None);
+                            }
                             break;
                         case MessageType.RemoteRequest:
                             {
+                                using var reqact = activitySource.StartActivity("RemoteRequest");
                                 // NOTE: should use without reflection(Expression.Compile)
                                 var header = Deserialize<RequestHeader>(message.KeyMemory, options.MessagePackSerializerOptions);
                                 var (mid, reqTypeName, resTypeName) = (header.MessageId, header.RequestType, header.ResponseType);
                                 byte[] resultBytes;
                                 try
                                 {
+                                    using var desact = activitySource.StartActivity("RemoteRequestDeserialize");
                                     var t = AsyncRequestHandlerRegistory.Get(reqTypeName, resTypeName);
                                     var interfaceType = t.GetInterfaces().First(x => x.IsGenericType && x.Name.StartsWith("IAsyncRequestHandler"));
                                     var coreInterfaceType = t.GetInterfaces().First(x => x.IsGenericType && x.Name.StartsWith("IAsyncRequestHandlerCore"));
@@ -277,7 +300,9 @@ namespace MessagePipe.Interprocess.Workers
                                         .MakeGenericMethod(genericArgs[1]);
                                     var task = asTask.Invoke(null, new[] { responseTask });
 #endif
+                                    act?.AddEvent(new ActivityEvent("BeginAwait"));
                                     await ((System.Threading.Tasks.Task)task!); // Task<T> -> Task
+                                    act?.AddEvent(new ActivityEvent("BuildRemoteResponse"));
                                     var result = task.GetType().GetProperty("Result")!.GetValue(task);
                                     resultBytes = MessageBuilder.BuildRemoteResponseMessage(mid, genericArgs[1], result!, options.MessagePackSerializerOptions);
                                 }
@@ -286,13 +311,14 @@ namespace MessagePipe.Interprocess.Workers
                                     // NOTE: ok to send stacktrace?
                                     resultBytes = MessageBuilder.BuildRemoteResponseError(mid, ex.ToString(), options.MessagePackSerializerOptions);
                                 }
-
+                                using var sendact = activitySource.StartActivity("RemoteRequestSend");
                                 await client.SendAsync(resultBytes).ConfigureAwait(false);
                             }
                             break;
                         case MessageType.RemoteResponse:
                         case MessageType.RemoteError:
                             {
+                                using var resact = activitySource.StartActivity("RemoteResponse");
                                 var mid = Deserialize<int>(message.KeyMemory, options.MessagePackSerializerOptions);
                                 if (responseCompletions.TryRemove(mid, out var tcs))
                                 {
