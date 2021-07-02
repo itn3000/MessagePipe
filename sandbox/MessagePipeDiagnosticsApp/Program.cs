@@ -14,16 +14,15 @@ namespace MessagePipeDiagnosticsApp
 {
     public class MyAsyncHandler : IAsyncRequestHandler<int, byte[]>
     {
-        public async ValueTask<byte[]> InvokeAsync(int request, CancellationToken cancellationToken = default)
+        public ValueTask<byte[]> InvokeAsync(int request, CancellationToken cancellationToken = default)
         {
-            await Task.Delay(1);
             if (request == -1)
             {
                 throw new Exception("NO -1");
             }
             else
             {
-                return new byte[request];
+                return new ValueTask<byte[]>(new byte[request]);
             }
         }
     }
@@ -66,7 +65,10 @@ namespace MessagePipeDiagnosticsApp
                 .BuildServiceProvider()
                 ;
             var requestor = provider.GetService<IRemoteRequestHandler<int, byte[]>>() ?? throw new ArgumentNullException("provider");
-            await requestor.InvokeAsync(1);
+            for(int i = 0; i < 2; i++)
+            {
+                await requestor.InvokeAsync(1);
+            }
         }
     }
 }

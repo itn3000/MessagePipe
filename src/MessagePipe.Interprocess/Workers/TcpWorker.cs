@@ -132,17 +132,19 @@ namespace MessagePipe.Interprocess.Workers
                     _ = client.Value; // init
                     RunPublishLoop();
                 }
-                activity?.AddEvent(new ActivityEvent("IncMid"));
                 var mid = Interlocked.Increment(ref messageId);
                 var tcs = new TaskCompletionSource<IInterprocessValue>();
                 responseCompletions[mid] = tcs;
-                activity?.AddEvent(new ActivityEvent("BuildMsg"));
-                var buffer = MessageBuilder.BuildRemoteRequestMessage(typeof(TRequest), typeof(TResponse), mid, request, options.MessagePackSerializerOptions);
-                channel.Writer.TryWrite(buffer);
-                activity?.AddEvent(new ActivityEvent("WaitTask"));
-                var memoryValue = await tcs.Task.ConfigureAwait(false);
-                activity?.AddEvent(new ActivityEvent("Serialize"));
-                return MessagePackSerializer.Deserialize<TResponse>(memoryValue.ValueMemory, options.MessagePackSerializerOptions);
+                using(var act2 = activitySource.StartActivity("Request2"))
+                {
+                    var buffer = MessageBuilder.BuildRemoteRequestMessage(typeof(TRequest), typeof(TResponse), mid, request, options.MessagePackSerializerOptions);
+                    channel.Writer.TryWrite(buffer);
+                    using (activitySource.StartActivity("RequestAwait"))
+                    {
+                        var memoryValue = await tcs.Task.ConfigureAwait(false);
+                        return MessagePackSerializer.Deserialize<TResponse>(memoryValue.ValueMemory, options.MessagePackSerializerOptions);
+                    }
+                }
             }
         }
 
@@ -214,43 +216,49 @@ namespace MessagePipe.Interprocess.Workers
                         buffer.AsSpan(readLen).CopyTo(newBuffer.AsSpan(readBuffer.Length));
                         readBuffer = newBuffer;
                     }
-
+                    act?.AddTag("readbuffer", readBuffer.Length);
                     using var fetchmsgact = activitySource.StartActivity("FetchMessage");
                     var messageLen = MessageBuilder.FetchMessageLength(readBuffer.Span);
-                    if (readBuffer.Length == (messageLen + 4)) // just size
+                    using (var afterparse = activitySource.StartActivity("AfterParseMessage"))
                     {
-                        value = readBuffer.Slice(4, messageLen); // skip length header
-                        readBuffer = Array.Empty<byte>();
-                        goto PARSE_MESSAGE;
-                    }
-                    else if (readBuffer.Length > (messageLen + 4)) // over size
-                    {
-                        value = readBuffer.Slice(4, messageLen);
-                        readBuffer = readBuffer.Slice(messageLen + 4);
-                        goto PARSE_MESSAGE;
-                    }
-                    else // needs to read more
-                    {
-                        var readLen = readBuffer.Length;
-                        if (readLen < (messageLen + 4))
+                        if (readBuffer.Length == (messageLen + 4)) // just size
                         {
-                            if (readBuffer.Length != buffer.Length)
-                            {
-                                var newBuffer = new byte[buffer.Length];
-                                readBuffer.CopyTo(newBuffer);
-                                buffer = newBuffer;
-                            }
-
-                            if (buffer.Length < messageLen + 4)
-                            {
-                                Array.Resize(ref buffer, messageLen + 4);
-                            }
+                            afterparse?.AddTag("pattern", 1);
+                            value = readBuffer.Slice(4, messageLen); // skip length header
+                            readBuffer = Array.Empty<byte>();
+                            goto PARSE_MESSAGE;
                         }
-                        var remain = messageLen - (readLen - 4);
-                        await ReadFullyAsync(buffer, client, readLen, remain, token).ConfigureAwait(false);
-                        value = buffer.AsMemory(4, messageLen);
-                        readBuffer = Array.Empty<byte>();
-                        goto PARSE_MESSAGE;
+                        else if (readBuffer.Length > (messageLen + 4)) // over size
+                        {
+                            afterparse?.AddTag("pattern", 2);
+                            value = readBuffer.Slice(4, messageLen);
+                            readBuffer = readBuffer.Slice(messageLen + 4);
+                            goto PARSE_MESSAGE;
+                        }
+                        else // needs to read more
+                        {
+                            afterparse?.AddTag("pattern", 3);
+                            var readLen = readBuffer.Length;
+                            if (readLen < (messageLen + 4))
+                            {
+                                if (readBuffer.Length != buffer.Length)
+                                {
+                                    var newBuffer = new byte[buffer.Length];
+                                    readBuffer.CopyTo(newBuffer);
+                                    buffer = newBuffer;
+                                }
+
+                                if (buffer.Length < messageLen + 4)
+                                {
+                                    Array.Resize(ref buffer, messageLen + 4);
+                                }
+                            }
+                            var remain = messageLen - (readLen - 4);
+                            await ReadFullyAsync(buffer, client, readLen, remain, token).ConfigureAwait(false);
+                            value = buffer.AsMemory(4, messageLen);
+                            readBuffer = Array.Empty<byte>();
+                            goto PARSE_MESSAGE;
+                        }
                     }
                 }
                 catch (Exception ex)
@@ -300,9 +308,10 @@ namespace MessagePipe.Interprocess.Workers
                                         .MakeGenericMethod(genericArgs[1]);
                                     var task = asTask.Invoke(null, new[] { responseTask });
 #endif
-                                    act?.AddEvent(new ActivityEvent("BeginAwait"));
-                                    await ((System.Threading.Tasks.Task)task!); // Task<T> -> Task
-                                    act?.AddEvent(new ActivityEvent("BuildRemoteResponse"));
+                                    using(activitySource.StartActivity("RemoteRequestAwait"))
+                                    {
+                                        await ((System.Threading.Tasks.Task)task!); // Task<T> -> Task
+                                    }
                                     var result = task.GetType().GetProperty("Result")!.GetValue(task);
                                     resultBytes = MessageBuilder.BuildRemoteResponseMessage(mid, genericArgs[1], result!, options.MessagePackSerializerOptions);
                                 }
