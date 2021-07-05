@@ -55,6 +55,7 @@ namespace MessagePipe.Interprocess
         public string Host { get; }
         public int Port { get; }
         public bool? HostAsServer { get; set; }
+        public int ReceiveTaskNum { get; set; }
 
         public MessagePipeInterprocessTcpOptions(string host, int port)
             : base()
@@ -62,6 +63,7 @@ namespace MessagePipe.Interprocess
             this.Host = host;
             this.Port = port;
             this.HostAsServer = null;
+            this.ReceiveTaskNum = 1;
         }
     }
 #if NET5_0_OR_GREATER
@@ -82,6 +84,7 @@ namespace MessagePipe.Interprocess
         public int? SendBufferSize { get; set; }
         public int? ReceiveBufferSize { get; set; }
         public bool? HostAsServer { get; set; }
+        public int ReceiveTaskNum { get; set; }
         public MessagePipeInterprocessTcpUdsOptions(string socketPath): this(socketPath, null, null)
         {
         }
@@ -91,6 +94,7 @@ namespace MessagePipe.Interprocess
             HostAsServer = null;
             this.SendBufferSize = sendBufferSize;
             this.ReceiveBufferSize = recvBufferSize;
+            this.ReceiveTaskNum = 1;
         }
     }
 #endif

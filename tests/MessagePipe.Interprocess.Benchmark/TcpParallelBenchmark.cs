@@ -17,7 +17,9 @@ namespace MessagePipe.Interprocess.Benchmark
         public int DataSize { get; set; }
         [Params(1, 10)]
         public int TaskNum { get; set; }
-        const int TotalRequestNum = 10;
+        [Params(1, 10)]
+        public int ReceiveTaskNum { get; set; }
+        const int TotalRequestNum = 100;
         IServiceProvider CreateTcpIpServiceProvider(string ip, int port)
         {
             var services = new ServiceCollection();
@@ -25,6 +27,7 @@ namespace MessagePipe.Interprocess.Benchmark
             services.AddMessagePipeTcpInterprocess(ip, port, opts =>
             {
                 opts.HostAsServer = true;
+                opts.ReceiveTaskNum = ReceiveTaskNum;
             });
             return services.BuildServiceProvider();
         }
@@ -41,6 +44,7 @@ namespace MessagePipe.Interprocess.Benchmark
                 opt.HostAsServer = true;
                 opt.SendBufferSize = Math.Min(DataSize, 0x1000);
                 opt.ReceiveBufferSize = Math.Min(DataSize, 0x1000);
+                opt.ReceiveTaskNum = ReceiveTaskNum;
             });
             return services.BuildServiceProvider();
         }
@@ -108,7 +112,7 @@ namespace MessagePipe.Interprocess.Benchmark
             }
             await ClientTask(_TcpUdsProvider, TaskNum);
         }
-        [Benchmark]
+        //[Benchmark]
         public async Task TcpIpPubSub()
         {
             if (_TcpIpProvider == null)
@@ -118,7 +122,7 @@ namespace MessagePipe.Interprocess.Benchmark
             using var cts = new CancellationTokenSource();
             await Task.WhenAll(PublisherAsync(_TcpIpProvider, TaskNum, cts), SubscriberTask(_TcpIpProvider, cts.Token));
         }
-        [Benchmark]
+        //[Benchmark]
         public async Task TcpUdsPubSub()
         {
             if(_TcpUdsProvider == null)

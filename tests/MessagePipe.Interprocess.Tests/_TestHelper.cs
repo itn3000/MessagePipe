@@ -45,6 +45,7 @@ namespace MessagePipe.Interprocess.Tests
             {
                 x.HostAsServer = asServer;
                 x.UnhandledErrorHandler = (msg, e) => helper.WriteLine(msg + e);
+                x.ReceiveTaskNum = 10;
             });
             return sc.BuildServiceProvider();
         }

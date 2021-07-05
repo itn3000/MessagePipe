@@ -11,9 +11,64 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Threading.Tasks.Sources;
 
 namespace MessagePipe.Interprocess.Workers
 {
+#if NET5_0_OR_GREATER
+    internal class InternalValueTaskSource<T> : System.Threading.Tasks.Sources.IValueTaskSource<T>
+    {
+        InternalValueTaskSource<T>[]? _pooled;
+        System.Buffers.ArrayPool<InternalValueTaskSource<T>>? _pool;
+        System.Threading.Tasks.Sources.ManualResetValueTaskSourceCore<T> _core;
+        public InternalValueTaskSource()
+        {
+            _pooled = null;
+            _pool = null;
+        }
+        public void Initialize(System.Buffers.ArrayPool<InternalValueTaskSource<T>> pool, InternalValueTaskSource<T>[] pooled)
+        {
+            _pool = pool;
+            _pooled = pooled;
+            _core.Reset();
+        }
+        public void SetResult(T result) => _core.SetResult(result);
+        public void SetException(Exception ex) => _core.SetException(ex);
+        public T GetResult(short token)
+        {
+            var result = _core.GetResult(token);
+            if (_pooled != null && _pool != null)
+            {
+                var pooled = _pooled;
+                _pooled = null;
+                _pool.Return(pooled);
+            }
+            return result;
+        }
+
+        public ValueTaskSourceStatus GetStatus(short token)
+        {
+            return _core.GetStatus(token);
+        }
+
+        public void OnCompleted(Action<object?> continuation, object? state, short token, ValueTaskSourceOnCompletedFlags flags)
+        {
+            _core.OnCompleted(continuation, state, token, flags);
+        }
+        public static InternalValueTaskSource<T> GetInstance(System.Buffers.ArrayPool<InternalValueTaskSource<T>> pool)
+        {
+            var pooled = pool.Rent(1);
+            if(pooled[0] == null)
+            {
+                pooled[0] = new InternalValueTaskSource<T>();
+            }
+            pooled[0].Initialize(pool, pooled);
+            return pooled[0];
+        }
+    }
+
+#endif
+
     [Preserve]
     public sealed class TcpWorker : IDisposable
     {
@@ -45,7 +100,7 @@ namespace MessagePipe.Interprocess.Workers
 
             this.server = new Lazy<SocketTcpServer>(() =>
             {
-                return SocketTcpServer.Listen(options.Host, options.Port);
+                return SocketTcpServer.Listen(options.Host, options.Port, options.ReceiveTaskNum);
             });
 
             this.client = new Lazy<SocketTcpClient>(() =>
@@ -80,7 +135,7 @@ namespace MessagePipe.Interprocess.Workers
 
             this.server = new Lazy<SocketTcpServer>(() =>
             {
-                return SocketTcpServer.ListenUds(options.SocketPath);
+                return SocketTcpServer.ListenUds(options.SocketPath, receiveNum: options.ReceiveTaskNum);
             });
 
             this.client = new Lazy<SocketTcpClient>(() =>
@@ -171,7 +226,6 @@ namespace MessagePipe.Interprocess.Workers
                 s.StartAcceptLoopAsync(RunReceiveLoop, cancellationTokenSource.Token);
             }
         }
-
         // Receive from tcp socket and push value to subscribers.
         async void RunReceiveLoop(SocketTcpClient client)
         {

@@ -16,15 +16,16 @@ namespace MessagePipe.Interprocess.Benchmark
     }
     public class MyAsyncHandler : IAsyncRequestHandler<int, byte[]>
     {
-        public ValueTask<byte[]> InvokeAsync(int request, CancellationToken cancellationToken = default)
+        public async ValueTask<byte[]> InvokeAsync(int request, CancellationToken cancellationToken = default)
         {
+            await Task.Delay(1);
             if (request == -1)
             {
                 throw new Exception("NO -1");
             }
             else
             {
-                return new ValueTask<byte[]>(new byte[request]);
+                return new byte[request];
             }
         }
     }

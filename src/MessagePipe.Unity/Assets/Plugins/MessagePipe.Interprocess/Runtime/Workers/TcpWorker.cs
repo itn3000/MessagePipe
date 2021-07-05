@@ -12,8 +12,65 @@ using Cysharp.Threading.Tasks;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
+
 namespace MessagePipe.Interprocess.Workers
 {
+#if NET5_0_OR_GREATER
+    internal class InternalUniTaskSource<T> : Cysharp.Threading.Tasks.Sources.IUniTaskSource<T>
+    {
+        InternalUniTaskSource<T>[]? _pooled;
+        System.Buffers.ArrayPool<InternalUniTaskSource<T>>? _pool;
+        Cysharp.Threading.Tasks.Sources.UniTaskCompletionSourceCore<T> _core;
+        public InternalUniTaskSource()
+        {
+            _pooled = null;
+            _pool = null;
+        }
+        public void Initialize(System.Buffers.ArrayPool<InternalUniTaskSource<T>> pool, InternalUniTaskSource<T>[] pooled)
+        {
+            _pool = pool;
+            _pooled = pooled;
+            _core.Reset();
+        }
+        public void SetResult(T result) => _core.TrySetResult(result);
+        public void SetException(Exception ex) => _core.TrySetException(ex);
+        public T GetResult(short token)
+        {
+            var result = _core.GetResult(token);
+            if (_pooled != null && _pool != null)
+            {
+                var pooled = _pooled;
+                _pooled = null;
+                _pool.Return(pooled);
+            }
+            return result;
+        }
+
+        void IUniTaskSource.GetResult(short token) => GetResult(token);
+        public UniTaskStatus UnsafeGetStatus() => core.UnsafeGetStatus();
+        public /*replaced*/ UniTaskStatus GetStatus(short token)
+        {
+            return _core.GetStatus(token);
+        }
+
+        public void OnCompleted(Action<object> continuation, object state, short token)
+        {
+            _core.OnCompleted(continuation, state, token, flags);
+        }
+        public static InternalUniTaskSource<T> GetInstance(System.Buffers.ArrayPool<InternalUniTaskSource<T>> pool)
+        {
+            var pooled = pool.Rent(1);
+            if(pooled[0] == null)
+            {
+                pooled[0] = new InternalUniTaskSource<T>();
+            }
+            pooled[0].Initialize(pool, pooled);
+            return pooled[0];
+        }
+    }
+
+#endif
+
     [Preserve]
     public sealed class TcpWorker : IDisposable
     {
@@ -45,7 +102,7 @@ namespace MessagePipe.Interprocess.Workers
 
             this.server = new Lazy<SocketTcpServer>(() =>
             {
-                return SocketTcpServer.Listen(options.Host, options.Port);
+                return SocketTcpServer.Listen(options.Host, options.Port, options.ReceiveTaskNum);
             });
 
             this.client = new Lazy<SocketTcpClient>(() =>
@@ -80,7 +137,7 @@ namespace MessagePipe.Interprocess.Workers
 
             this.server = new Lazy<SocketTcpServer>(() =>
             {
-                return SocketTcpServer.ListenUds(options.SocketPath);
+                return SocketTcpServer.ListenUds(options.SocketPath, receiveNum: options.ReceiveTaskNum);
             });
 
             this.client = new Lazy<SocketTcpClient>(() =>
@@ -171,7 +228,6 @@ namespace MessagePipe.Interprocess.Workers
                 s.StartAcceptLoopAsync(RunReceiveLoop, cancellationTokenSource.Token);
             }
         }
-
         // Receive from tcp socket and push value to subscribers.
         async void RunReceiveLoop(SocketTcpClient client)
         {

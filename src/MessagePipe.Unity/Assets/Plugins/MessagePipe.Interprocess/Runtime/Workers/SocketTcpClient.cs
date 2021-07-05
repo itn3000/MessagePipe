@@ -3,6 +3,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Threading;
 using Cysharp.Threading.Tasks;
+using System.Linq;
 
 namespace MessagePipe.Interprocess.Workers
 {
@@ -13,7 +14,7 @@ namespace MessagePipe.Interprocess.Workers
         const int MaxConnections = 0x7fffffff;
 
         readonly Socket socket;
-
+        int _TaskNum = 1;
         SocketTcpServer(AddressFamily addressFamily, ProtocolType protocolType, int? sendBufferSize, int? recvBufferSize)
         {
             socket = new Socket(addressFamily, SocketType.Stream, protocolType);
@@ -26,6 +27,19 @@ namespace MessagePipe.Interprocess.Workers
                 socket.ReceiveBufferSize = recvBufferSize.Value;
             }
         }
+        SocketTcpServer(AddressFamily addressFamily, ProtocolType protocolType, int? sendBufferSize, int? recvBufferSize, int taskNum)
+        {
+            socket = new Socket(addressFamily, SocketType.Stream, protocolType);
+            if (sendBufferSize.HasValue)
+            {
+                socket.SendBufferSize = sendBufferSize.Value;
+            }
+            if (recvBufferSize.HasValue)
+            {
+                socket.ReceiveBufferSize = recvBufferSize.Value;
+            }
+            _TaskNum = taskNum;
+        }
 
         public static SocketTcpServer Listen(string host, int port)
         {
@@ -36,7 +50,15 @@ namespace MessagePipe.Interprocess.Workers
             server.socket.Listen(MaxConnections);
             return server;
         }
+        public static SocketTcpServer Listen(string host, int port, int recvTaskNum)
+        {
+            var ip = new IPEndPoint(IPAddress.Parse(host), port);
+            var server = new SocketTcpServer(ip.AddressFamily, ProtocolType.Tcp, null, null, recvTaskNum);
 
+            server.socket.Bind(ip);
+            server.socket.Listen(MaxConnections);
+            return server;
+        }
 #if NET5_0_OR_GREATER
         /// <summary>
         /// create TCP unix domain socket server and listen
@@ -44,19 +66,23 @@ namespace MessagePipe.Interprocess.Workers
         /// <param name="domainSocketPath">path to unix domain socket</param>
         /// <param name="recvBufferSize">socket's receive buffer size</param>
         /// <param name="sendBufferSize">socket's send buffer size</param>
+        /// <param name="receiveNum">receive task parallel number</param>
         /// <exception cref="SocketException">unix domain socket not supported or socket already exists</exception>
         /// <returns>TCP unix domain socket server</returns>
-        public static SocketTcpServer ListenUds(string domainSocketPath, int? sendBufferSize = null, int? recvBufferSize = null)
+        public static SocketTcpServer ListenUds(string domainSocketPath, int? sendBufferSize = null, int? recvBufferSize = null, int receiveNum = 1)
         {
-            var server = new SocketTcpServer(AddressFamily.Unix, ProtocolType.IP, sendBufferSize, recvBufferSize);
+            var server = new SocketTcpServer(AddressFamily.Unix, ProtocolType.IP, sendBufferSize, recvBufferSize, receiveNum);
             server.socket.Bind(new UnixDomainSocketEndPoint(domainSocketPath));
             server.socket.Listen(MaxConnections);
             return server;
         }
 #endif
-
+        System.Threading.Channels.Channel<Tuple<Action<SocketTcpClient>, SocketTcpClient>> channel = System.Threading.Channels.Channel.CreateUnbounded<Tuple<Action<SocketTcpClient>, SocketTcpClient>>(
+            new System.Threading.Channels.UnboundedChannelOptions()
+            { SingleReader = false, SingleWriter = false, AllowSynchronousContinuations = false });
         public async void StartAcceptLoopAsync(Action<SocketTcpClient> onAccept, CancellationToken cancellationToken)
         {
+            StartAcceptDispatchTask(this._TaskNum, cancellationToken);
             while (!cancellationToken.IsCancellationRequested)
             {
                 Socket remote = default;
@@ -68,8 +94,45 @@ namespace MessagePipe.Interprocess.Workers
                 {
                     return;
                 }
-                onAccept(new SocketTcpClient(remote));
+                if(_TaskNum <= 1)
+                {
+                    onAccept(new SocketTcpClient(remote));
+                }
+                else
+                {
+                    channel.Writer.TryWrite(Tuple.Create(onAccept, new SocketTcpClient(remote)));
+                }
             }
+        }
+
+        async void StartAcceptDispatchTask(int taskNum, CancellationToken ct)
+        {
+            if(taskNum <= 1)
+            {
+                return;
+            }
+            await Task.WhenAll(Enumerable.Range(0, taskNum).Select(async idx =>
+            {
+                try
+                {
+                    while (!ct.IsCancellationRequested)
+                    {
+                        if (!await channel.Reader.WaitToReadAsync(ct))
+                        {
+                            break;
+                        }
+                        while (channel.Reader.TryRead(out var item))
+                        {
+                            item.Item1(item.Item2);
+                        }
+                    }
+                }
+                catch
+                {
+                }
+
+            }));
+
         }
 
         public void Dispose()
